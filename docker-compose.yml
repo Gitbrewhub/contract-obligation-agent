@@ -1,0 +1,18 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: contract-obligation-db
+
+    environment:
+      POSTGRES_USER: contract_user
+      POSTGRES_PASSWORD: contract_password
+      POSTGRES_DB: contracts_db
+
+    ports:
+      - "5432:5432"
+
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+volumes:
+  postgres_data:

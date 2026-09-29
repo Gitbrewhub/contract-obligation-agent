@@ -1,0 +1,1800 @@
+﻿
+
+============================================================
+FILE: backend\app.py
+============================================================
+from datetime import datetime
+from pathlib import Path
+import traceback
+
+from flask import Flask, jsonify, request
+from werkzeug.utils import secure_filename
+
+from database.retrieval import get_obligations_by_contract
+from graph.workflow import build_contract_graph
+
+
+UPLOAD_FOLDER = Path("contracts/uploads")
+
+ALLOWED_EXTENSIONS = {
+    ".pdf",
+    ".docx",
+}
+
+
+def create_app():
+    app = Flask(__name__)
+
+    app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
+
+    UPLOAD_FOLDER.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    # Build the LangGraph once when the Flask app starts.
+    contract_graph = build_contract_graph()
+
+    @app.get("/health")
+    def health():
+        return jsonify(
+            {
+                "status": "ok",
+                "service": "contract-obligation-agent",
+                "orchestration": "langgraph",
+            }
+        )
+
+    @app.get(
+        "/contracts/<int:contract_id>/obligations"
+    )
+    def get_contract_obligations(
+        contract_id,
+    ):
+        obligations = (
+            get_obligations_by_contract(
+                contract_id
+            )
+        )
+
+        return jsonify(
+            {
+                "contract_id": contract_id,
+                "count": len(obligations),
+                "obligations": obligations,
+            }
+        )
+
+    @app.post("/contracts/upload")
+    def upload_contract():
+
+        print("\n" + "=" * 80)
+        print("UPLOAD REQUEST RECEIVED")
+        print("=" * 80)
+
+        if "file" not in request.files:
+            print("ERROR: No file provided")
+
+            return jsonify(
+                {
+                    "error": "No file provided"
+                }
+            ), 400
+
+        uploaded_file = request.files["file"]
+
+        if not uploaded_file.filename:
+            print("ERROR: No filename provided")
+
+            return jsonify(
+                {
+                    "error": "No filename provided"
+                }
+            ), 400
+
+        filename = secure_filename(
+            uploaded_file.filename
+        )
+
+        if not filename:
+            print("ERROR: Invalid filename")
+
+            return jsonify(
+                {
+                    "error": "Invalid filename"
+                }
+            ), 400
+
+        extension = Path(
+            filename
+        ).suffix.lower()
+
+        if extension not in ALLOWED_EXTENSIONS:
+            print(
+                f"ERROR: Unsupported file type: {extension}"
+            )
+
+            return jsonify(
+                {
+                    "error": (
+                        "Unsupported file type. "
+                        "Only PDF and DOCX files "
+                        "are supported."
+                    )
+                }
+            ), 400
+
+        upload_path = (
+            app.config["UPLOAD_FOLDER"]
+            / filename
+        )
+
+        print(
+            f"Saving uploaded file: {upload_path}"
+        )
+
+        uploaded_file.save(
+            upload_path
+        )
+
+        print(
+            "File saved successfully."
+        )
+
+        print(
+            "Starting LangGraph contract processing..."
+        )
+
+        try:
+
+            result = contract_graph.invoke(
+                {
+                    "file_path": str(
+                        upload_path
+                    ),
+                    "reference_date": (
+                        datetime.now()
+                    ),
+                }
+            )
+
+            print(
+                "LangGraph processing completed."
+            )
+
+        except Exception as exc:
+
+            print("\n")
+            print("=" * 80)
+            print("CONTRACT PROCESSING ERROR")
+            print("=" * 80)
+            print(
+                f"Exception type: {type(exc).__name__}"
+            )
+            print(
+                f"Exception message: {exc}"
+            )
+            print("-" * 80)
+            traceback.print_exc()
+            print("=" * 80)
+            print("\n")
+
+            return jsonify(
+                {
+                    "error": (
+                        "Contract processing failed"
+                    ),
+                    "details": str(exc),
+                    "exception_type": (
+                        type(exc).__name__
+                    ),
+                }
+            ), 500
+
+        results = result.get(
+            "results",
+            [],
+        )
+
+        contract_id = result.get(
+            "contract_id"
+        )
+
+        print(
+            f"Contract ID: {contract_id}"
+        )
+
+        print(
+            f"Obligations found: {len(results)}"
+        )
+
+        print(
+            "Upload request completed successfully."
+        )
+
+        print("=" * 80)
+        print()
+
+        return jsonify(
+            {
+                "contract_id": contract_id,
+                "filename": filename,
+                "count": len(results),
+                "orchestration": "langgraph",
+                "obligations": results,
+            }
+        ), 201
+
+    return app
+
+
+app = create_app()
+
+
+if __name__ == "__main__":
+    app.run(
+        host="127.0.0.1",
+        port=5000,
+        debug=False,
+        use_reloader=False,
+    )
+
+
+============================================================
+FILE: graph\nodes.py
+============================================================
+from datetime import datetime
+from pathlib import Path
+
+from agents.extraction_agent import extract_obligations
+from agents.risk_engine import evaluate_obligation
+from agents.validation import validate_obligations
+from agents.verification_agent import verify_with_nvidia
+
+from database.repository import (
+    create_contract,
+    insert_document_chunk,
+    insert_obligation,
+)
+
+from database.retrieval import search_similar_chunks
+
+from ingestion.chunker import chunk_text
+from ingestion.embedder import generate_embedding
+from ingestion.loader import extract_contract_text
+
+from utils.deadline_parser import parse_deadline
+
+from graph.state import ContractState
+
+
+def ingest_node(state: ContractState) -> ContractState:
+    """
+    LangGraph node responsible for:
+    1. Loading the contract
+    2. Extracting text
+    3. Splitting text into chunks
+    4. Creating the contract record
+    5. Storing chunks and embeddings
+    """
+
+    file_path = state["file_path"]
+
+    path = Path(file_path)
+
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Contract file not found: {file_path}"
+        )
+
+    contract_text = extract_contract_text(
+        str(path)
+    )
+
+    if not contract_text.strip():
+        raise ValueError(
+            "Contract contains no extractable text"
+        )
+
+    chunks = chunk_text(
+        contract_text
+    )
+
+    if not chunks:
+        raise ValueError(
+            "No chunks were generated"
+        )
+
+    contract_id = create_contract(
+        path.name
+    )
+
+    for chunk_index, chunk in enumerate(chunks):
+
+        embedding = generate_embedding(
+            chunk
+        )
+
+        insert_document_chunk(
+            contract_id=contract_id,
+            chunk_index=chunk_index,
+            content=chunk,
+            embedding=embedding,
+        )
+
+    return {
+        **state,
+        "contract_id": contract_id,
+        "contract_text": contract_text,
+        "chunks": chunks,
+    }
+
+
+def extraction_node(
+    state: ContractState,
+) -> ContractState:
+    """
+    Extract obligations from every contract chunk.
+    """
+
+    chunks = state["chunks"]
+
+    extracted_obligations = []
+
+    for chunk in chunks:
+
+        obligations = extract_obligations(
+            chunk
+        )
+
+        extracted_obligations.extend(
+            obligations
+        )
+
+    return {
+        **state,
+        "extracted_obligations": (
+            extracted_obligations
+        ),
+    }
+
+
+def validation_node(
+    state: ContractState,
+) -> ContractState:
+    """
+    Validate extracted obligations using Pydantic.
+    """
+
+    extracted = state[
+        "extracted_obligations"
+    ]
+
+    validated = validate_obligations(
+        extracted
+    )
+
+    validated_dicts = [
+        obligation.model_dump()
+        for obligation in validated
+    ]
+
+    return {
+        **state,
+        "validated_obligations": (
+            validated_dicts
+        ),
+    }
+
+
+def verification_node(
+    state: ContractState,
+) -> ContractState:
+    """
+    Verify each validated obligation against
+    the most relevant source chunks.
+    """
+
+    contract_id = state[
+        "contract_id"
+    ]
+
+    chunks = state["chunks"]
+
+    validated = state[
+        "validated_obligations"
+    ]
+
+    processed_obligations = []
+
+    for obligation in validated:
+
+        obligation_text = obligation[
+            "obligation_text"
+        ]
+
+        similar_chunks = search_similar_chunks(
+            query=obligation_text,
+            contract_id=contract_id,
+            top_k=3,
+        )
+
+        if not similar_chunks:
+            similar_chunks = [
+                {
+                    "id": None,
+                    "chunk_index": None,
+                    "content": chunks[0],
+                }
+            ]
+
+        best_verification = None
+        best_chunk = None
+
+        for candidate in similar_chunks:
+
+            verification = verify_with_nvidia(
+                obligation_text=obligation_text,
+                source_text=candidate[
+                    "content"
+                ],
+            )
+
+            if (
+                best_verification is None
+                or verification[
+                    "grounding_score"
+                ]
+                > best_verification[
+                    "grounding_score"
+                ]
+            ):
+                best_verification = (
+                    verification
+                )
+
+                best_chunk = candidate
+
+        verification_status = (
+            "VERIFIED"
+            if best_verification["verified"]
+            else "NOT_VERIFIED"
+        )
+
+        processed_obligations.append(
+            {
+                **obligation,
+                "verification_status": (
+                    verification_status
+                ),
+                "grounding_score": (
+                    best_verification[
+                        "grounding_score"
+                    ]
+                ),
+                "source_chunk_id": (
+                    best_chunk["id"]
+                ),
+                "source_chunk_index": (
+                    best_chunk["chunk_index"]
+                ),
+                "source_text": (
+                    best_verification.get(
+                        "source_text",
+                        best_chunk["content"],
+                    )
+                ),
+                "verification_reason": (
+                    best_verification.get(
+                        "reason",
+                        "",
+                    )
+                ),
+            }
+        )
+
+    return {
+        **state,
+        "processed_obligations": (
+            processed_obligations
+        ),
+    }
+
+
+def risk_node(
+    state: ContractState,
+) -> ContractState:
+    """
+    Calculate deadline information and risk tier
+    for every verified obligation.
+    """
+
+    reference_date = state.get(
+        "reference_date"
+    )
+
+    if reference_date is None:
+        reference_date = datetime.now()
+
+    processed = state[
+        "processed_obligations"
+    ]
+
+    final_results = []
+
+    for obligation in processed:
+
+        deadline_date = parse_deadline(
+            obligation.get(
+                "deadline"
+            )
+        )
+
+        risk = evaluate_obligation(
+            deadline_date,
+            reference_date,
+            obligation[
+                "verification_status"
+            ],
+        )
+
+        result = {
+            **obligation,
+            "parsed_deadline": (
+                deadline_date
+            ),
+            "days_until_deadline": (
+                risk[
+                    "days_until_deadline"
+                ]
+            ),
+            "risk_tier": (
+                risk["risk_tier"]
+            ),
+        }
+
+        obligation_id = insert_obligation(
+            contract_id=state[
+                "contract_id"
+            ],
+            party_responsible=obligation.get(
+                "party_responsible"
+            ),
+            obligation_text=obligation[
+                "obligation_text"
+            ],
+            deadline=obligation.get(
+                "deadline"
+            ),
+            clause_reference=obligation.get(
+                "clause_reference"
+            ),
+            verification_status=obligation[
+                "verification_status"
+            ],
+            grounding_score=obligation[
+                "grounding_score"
+            ],
+            risk_tier=risk[
+                "risk_tier"
+            ],
+            days_until_deadline=risk[
+                "days_until_deadline"
+            ],
+            source_chunk_id=obligation.get(
+                "source_chunk_id"
+            ),
+        )
+
+        result["id"] = obligation_id
+
+        final_results.append(
+            result
+        )
+
+    return {
+        **state,
+        "results": final_results,
+    }
+
+
+============================================================
+FILE: graph\workflow.py
+============================================================
+from langgraph.graph import END, START, StateGraph
+
+from graph.nodes import (
+    extraction_node,
+    ingest_node,
+    risk_node,
+    validation_node,
+    verification_node,
+)
+
+from graph.state import ContractState
+
+
+def build_contract_graph():
+    """
+    Build the Contract Obligation Tracking LangGraph.
+
+    Flow:
+
+    START
+      â†“
+    Ingestion
+      â†“
+    Extraction
+      â†“
+    Validation
+      â†“
+    Verification
+      â†“
+    Risk Analysis
+      â†“
+    END
+    """
+
+    graph = StateGraph(
+        ContractState
+    )
+
+    # Register nodes.
+    graph.add_node(
+        "ingestion",
+        ingest_node,
+    )
+
+    graph.add_node(
+        "extraction",
+        extraction_node,
+    )
+
+    graph.add_node(
+        "validation",
+        validation_node,
+    )
+
+    graph.add_node(
+        "verification",
+        verification_node,
+    )
+
+    graph.add_node(
+        "risk",
+        risk_node,
+    )
+
+    # Define execution order.
+    graph.add_edge(
+        START,
+        "ingestion",
+    )
+
+    graph.add_edge(
+        "ingestion",
+        "extraction",
+    )
+
+    graph.add_edge(
+        "extraction",
+        "validation",
+    )
+
+    graph.add_edge(
+        "validation",
+        "verification",
+    )
+
+    graph.add_edge(
+        "verification",
+        "risk",
+    )
+
+    graph.add_edge(
+        "risk",
+        END,
+    )
+
+    return graph.compile()
+
+
+============================================================
+FILE: agents\nvidia_client.py
+============================================================
+import os
+
+from dotenv import load_dotenv
+from openai import OpenAI
+
+
+load_dotenv()
+
+
+NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
+
+NVIDIA_BASE_URL = os.getenv(
+    "NVIDIA_BASE_URL",
+    "https://integrate.api.nvidia.com/v1",
+)
+
+NVIDIA_MODEL = os.getenv(
+    "NVIDIA_MODEL",
+    "nvidia/nemotron-3.5-lightning-30b-a3b",
+)
+
+
+if not NVIDIA_API_KEY:
+    raise ValueError("NVIDIA_API_KEY is not set in .env")
+
+
+client = OpenAI(
+    base_url=NVIDIA_BASE_URL,
+    api_key=NVIDIA_API_KEY,
+)
+
+
+def ask_nvidia(prompt: str) -> str:
+    """
+    Send a prompt to NVIDIA NIM and return only
+    the model's final visible response.
+    """
+
+    if not prompt or not prompt.strip():
+        raise ValueError("Prompt cannot be empty")
+
+    response = client.chat.completions.create(
+        model=NVIDIA_MODEL,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are a contract extraction API. "
+                    "Return only the requested JSON. "
+                    "Do not provide reasoning, analysis, explanations, "
+                    "markdown, or commentary."
+                ),
+            },
+            {
+                "role": "user",
+                "content": prompt,
+            },
+        ],
+        temperature=0.0,
+        max_tokens=1000,
+        extra_body={
+            "chat_template_kwargs": {
+                "enable_thinking": False
+            }
+        },
+    )
+
+    return response.choices[0].message.content
+
+
+============================================================
+FILE: agents\extraction_agent.py
+============================================================
+import json
+import re
+
+from agents.nvidia_client import ask_nvidia
+
+
+EXTRACTION_PROMPT = """
+You are a contract obligation extraction system.
+
+Analyze the contract text below and identify every explicit
+contractual obligation.
+
+For each obligation, extract exactly these fields:
+
+- party_responsible
+- obligation_text
+- deadline
+- clause_reference
+
+Rules:
+1. Extract only obligations explicitly supported by the source text.
+2. Do not invent information.
+3. If a deadline is not explicitly stated, use null.
+4. If a clause reference is not explicitly available, use null.
+5. Keep obligation_text faithful to the source.
+6. Return exactly ONE complete JSON array.
+7. Return an empty JSON array [] if there are no obligations.
+8. Do not return reasoning.
+9. Do not return Markdown.
+10. Do not use code fences.
+11. Do not use <think> or </think>.
+12. Do not return multiple JSON arrays.
+13. Complete the entire JSON response before stopping.
+14. Do not truncate the JSON.
+15. Keep the reason for each obligation out of the response.
+16. Return no fields other than the four requested fields.
+
+Expected structure:
+
+[
+  {
+    "party_responsible": "Supplier",
+    "obligation_text": "Submit the monthly progress report",
+    "deadline": "within ten business days after the end of each month",
+    "clause_reference": "4.2"
+  }
+]
+
+SOURCE CONTRACT TEXT:
+--------------------
+__CONTRACT_CHUNK__
+--------------------
+"""
+
+
+def _build_extraction_prompt(chunk: str) -> str:
+    """
+    Insert the contract text into the prompt without using
+    str.format(), so JSON braces in the prompt can never
+    become accidental format placeholders.
+    """
+
+    return EXTRACTION_PROMPT.replace(
+        "__CONTRACT_CHUNK__",
+        chunk,
+    )
+
+
+def _remove_thinking_sections(text: str) -> str:
+    """
+    Remove reasoning/thinking sections if the model returns them.
+    """
+
+    # Remove complete <think>...</think> sections.
+    text = re.sub(
+        r"<think>.*?</think>",
+        "",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    # If an unmatched </think> appears, keep only what follows it.
+    if "</think>" in text.lower():
+
+        matches = list(
+            re.finditer(
+                r"</think>",
+                text,
+                flags=re.IGNORECASE,
+            )
+        )
+
+        if matches:
+            text = text[
+                matches[-1].end():
+            ]
+
+    # Remove unmatched opening marker.
+    text = re.sub(
+        r"<think>",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    return text.strip()
+
+
+def _extract_complete_json_array(
+    response: str,
+) -> str:
+    """
+    Extract the first complete JSON array from the model response.
+
+    This parser understands JSON strings, so brackets inside
+    obligation text do not incorrectly terminate the array.
+    """
+
+    if not response or not response.strip():
+        raise ValueError(
+            "NVIDIA returned an empty extraction response"
+        )
+
+    cleaned = response.strip()
+
+    # Remove reasoning.
+    cleaned = _remove_thinking_sections(
+        cleaned
+    )
+
+    # Remove Markdown fences.
+    cleaned = re.sub(
+        r"```(?:json)?",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+
+    cleaned = cleaned.replace(
+        "```",
+        "",
+    ).strip()
+
+    # Find the opening JSON array.
+    start = cleaned.find("[")
+
+    if start == -1:
+        raise ValueError(
+            "NVIDIA response does not contain a JSON array. "
+            f"Response: {cleaned}"
+        )
+
+    depth = 0
+    in_string = False
+    escaped = False
+
+    for index in range(
+        start,
+        len(cleaned),
+    ):
+
+        char = cleaned[index]
+
+        if escaped:
+            escaped = False
+            continue
+
+        if char == "\\" and in_string:
+            escaped = True
+            continue
+
+        if char == '"':
+            in_string = not in_string
+            continue
+
+        if in_string:
+            continue
+
+        if char == "[":
+            depth += 1
+
+        elif char == "]":
+            depth -= 1
+
+            if depth == 0:
+                return cleaned[
+                    start:index + 1
+                ]
+
+    raise ValueError(
+        "NVIDIA returned an incomplete JSON array. "
+        "The response ended before the closing ']'."
+    )
+
+
+def _sanitize_json_string_controls(
+    json_text: str,
+) -> str:
+    """
+    Convert raw control characters occurring inside JSON strings
+    into valid escaped characters.
+    """
+
+    output = []
+
+    in_string = False
+    escaped = False
+
+    for char in json_text:
+
+        if escaped:
+            output.append(char)
+            escaped = False
+            continue
+
+        if char == "\\" and in_string:
+            output.append(char)
+            escaped = True
+            continue
+
+        if char == '"':
+            output.append(char)
+            in_string = not in_string
+            continue
+
+        if in_string:
+
+            if char == "\n":
+                output.append("\\n")
+                continue
+
+            if char == "\r":
+                output.append("\\r")
+                continue
+
+            if char == "\t":
+                output.append("\\t")
+                continue
+
+            if ord(char) < 32:
+                continue
+
+        output.append(char)
+
+    return "".join(output)
+
+
+def clean_json_response(
+    response: str,
+) -> str:
+    """
+    Clean and extract a complete JSON array.
+    """
+
+    json_text = _extract_complete_json_array(
+        response
+    )
+
+    json_text = _sanitize_json_string_controls(
+        json_text
+    )
+
+    return json_text.strip()
+
+
+def extract_obligations(
+    chunk: str,
+) -> list[dict]:
+    """
+    Extract contractual obligations from one contract chunk
+    using NVIDIA NIM.
+    """
+
+    if not chunk or not chunk.strip():
+        raise ValueError(
+            "Contract chunk cannot be empty"
+        )
+
+    prompt = _build_extraction_prompt(
+        chunk
+    )
+
+    response = ask_nvidia(
+        prompt
+    )
+
+    cleaned_response = clean_json_response(
+        response
+    )
+
+    try:
+        obligations = json.loads(
+            cleaned_response
+        )
+
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            "NVIDIA returned invalid extraction JSON: "
+            f"{cleaned_response}"
+        ) from exc
+
+    if not isinstance(
+        obligations,
+        list,
+    ):
+        raise ValueError(
+            "NVIDIA extraction response must be a JSON array"
+        )
+
+    for item in obligations:
+
+        if not isinstance(
+            item,
+            dict,
+        ):
+            raise ValueError(
+                "Each extracted obligation must be a JSON object"
+            )
+
+        if "obligation_text" not in item:
+            raise ValueError(
+                "Extracted obligation is missing "
+                "'obligation_text'"
+            )
+
+    return obligations
+
+
+============================================================
+FILE: agents\verification_agent.py
+============================================================
+import json
+import re
+
+from agents.nvidia_client import ask_nvidia
+
+
+VERIFICATION_PROMPT = """
+You are a contract evidence verification system.
+
+Determine whether the extracted obligation is directly supported
+by the source text.
+
+EXTRACTED OBLIGATION:
+{obligation}
+
+SOURCE TEXT:
+--------------------
+{source_text}
+--------------------
+
+Return exactly ONE JSON object.
+
+The JSON object MUST contain:
+- verified: true or false
+- grounding_score: number between 0 and 1
+- source_text: exact supporting passage, or empty string
+- reason: short explanation
+
+Rules:
+1. verified=true only if the source directly supports the obligation.
+2. verified=false if the source does not support it.
+3. Do not use outside knowledge.
+4. Do not invent facts.
+5. Keep source_text short.
+6. Return ONLY JSON.
+7. Do not return Markdown.
+8. Do not return <think>.
+9. Do not return </think>.
+10. Do not return multiple JSON objects.
+11. Do not put newline characters inside JSON string values.
+12. Keep the reason under 30 words.
+"""
+
+
+def cosine_similarity(
+    embedding_a: list[float],
+    embedding_b: list[float],
+) -> float:
+
+    if not embedding_a or not embedding_b:
+        raise ValueError(
+            "Embeddings cannot be empty"
+        )
+
+    if len(embedding_a) != len(embedding_b):
+        raise ValueError(
+            "Embedding dimensions must match"
+        )
+
+    dot_product = sum(
+        a * b
+        for a, b in zip(embedding_a, embedding_b)
+    )
+
+    magnitude_a = sum(
+        a * a
+        for a in embedding_a
+    ) ** 0.5
+
+    magnitude_b = sum(
+        b * b
+        for b in embedding_b
+    ) ** 0.5
+
+    if magnitude_a == 0 or magnitude_b == 0:
+        return 0.0
+
+    return dot_product / (
+        magnitude_a * magnitude_b
+    )
+
+
+def _extract_json_object(response: str) -> str:
+    """
+    Extract the first complete JSON object from the
+    model response.
+
+    Handles:
+    - Markdown fences
+    - <think> blocks
+    - multiple JSON objects
+    - accidental text around JSON
+    """
+
+    if not response or not response.strip():
+        raise ValueError(
+            "NVIDIA returned an empty verification response"
+        )
+
+    text = response.strip()
+
+    # Remove markdown fences.
+    text = re.sub(
+        r"```(?:json)?",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    text = text.replace(
+        "```",
+        "",
+    )
+
+    # If there is a </think> marker, prefer the text
+    # AFTER the last marker.
+    if "</think>" in text.lower():
+        positions = [
+            m.start()
+            for m in re.finditer(
+                r"</think>",
+                text,
+                flags=re.IGNORECASE,
+            )
+        ]
+
+        if positions:
+            text = text[
+                positions[-1]
+                + len("</think>"):
+            ]
+
+    text = text.strip()
+
+    # Find the first opening brace.
+    start = text.find("{")
+
+    if start == -1:
+        raise ValueError(
+            "NVIDIA response does not contain a JSON object"
+        )
+
+    # Parse braces while respecting JSON strings.
+    depth = 0
+    in_string = False
+    escaped = False
+
+    for index in range(
+        start,
+        len(text),
+    ):
+
+        char = text[index]
+
+        if escaped:
+            escaped = False
+            continue
+
+        if char == "\\" and in_string:
+            escaped = True
+            continue
+
+        if char == '"':
+            in_string = not in_string
+            continue
+
+        if in_string:
+            continue
+
+        if char == "{":
+            depth += 1
+
+        elif char == "}":
+            depth -= 1
+
+            if depth == 0:
+                return text[
+                    start:index + 1
+                ]
+
+    raise ValueError(
+        "NVIDIA returned incomplete JSON"
+    )
+
+
+def _sanitize_json_strings(
+    json_text: str,
+) -> str:
+    """
+    Remove control characters from JSON string values.
+
+    This protects against the model inserting raw newlines
+    or reasoning markers inside a JSON string.
+    """
+
+    cleaned = []
+
+    in_string = False
+    escaped = False
+
+    for char in json_text:
+
+        if escaped:
+            cleaned.append(char)
+            escaped = False
+            continue
+
+        if char == "\\" and in_string:
+            cleaned.append(char)
+            escaped = True
+            continue
+
+        if char == '"':
+            cleaned.append(char)
+            in_string = not in_string
+            continue
+
+        if in_string:
+
+            if char == "\n":
+                cleaned.append("\\n")
+                continue
+
+            if char == "\r":
+                cleaned.append("\\r")
+                continue
+
+            if char == "\t":
+                cleaned.append("\\t")
+                continue
+
+            # Remove accidental control characters.
+            if ord(char) < 32:
+                continue
+
+        cleaned.append(char)
+
+    return "".join(cleaned)
+
+
+def _clean_json_response(
+    response: str,
+) -> str:
+
+    json_text = _extract_json_object(
+        response
+    )
+
+    # Remove reasoning markers that may have leaked
+    # into a JSON string.
+    json_text = json_text.replace(
+        "<think>",
+        "",
+    )
+
+    json_text = json_text.replace(
+        "</think>",
+        "",
+    )
+
+    json_text = _sanitize_json_strings(
+        json_text
+    )
+
+    return json_text.strip()
+
+
+def verify_with_nvidia(
+    obligation_text: str,
+    source_text: str,
+) -> dict:
+
+    if not obligation_text or not obligation_text.strip():
+        raise ValueError(
+            "Obligation text cannot be empty"
+        )
+
+    if not source_text or not source_text.strip():
+        raise ValueError(
+            "Source text cannot be empty"
+        )
+
+    prompt = VERIFICATION_PROMPT.format(
+        obligation=obligation_text,
+        source_text=source_text,
+    )
+
+    response = ask_nvidia(prompt)
+
+    cleaned_response = _clean_json_response(
+        response
+    )
+
+    try:
+        result = json.loads(
+            cleaned_response
+        )
+
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            "NVIDIA returned invalid verification JSON: "
+            f"{cleaned_response}"
+        ) from exc
+
+    if not isinstance(result, dict):
+        raise ValueError(
+            "Verification response must be a JSON object"
+        )
+
+    if "verified" not in result:
+        raise ValueError(
+            "Verification response is missing 'verified'"
+        )
+
+    if "grounding_score" not in result:
+        raise ValueError(
+            "Verification response is missing "
+            "'grounding_score'"
+        )
+
+    if "source_text" not in result:
+        result["source_text"] = ""
+
+    if "reason" not in result:
+        result["reason"] = ""
+
+    result["verified"] = bool(
+        result["verified"]
+    )
+
+    try:
+        result["grounding_score"] = float(
+            result["grounding_score"]
+        )
+    except (
+        TypeError,
+        ValueError,
+    ) as exc:
+        raise ValueError(
+            "grounding_score must be numeric"
+        ) from exc
+
+    result["grounding_score"] = max(
+        0.0,
+        min(
+            1.0,
+            result["grounding_score"],
+        ),
+    )
+
+    return result
+
+
+def verify_obligation(
+    obligation_text: str,
+    source_text: str,
+    threshold: float = 0.70,
+) -> dict:
+    """
+    Legacy semantic verification function.
+
+    Kept compatible with the existing tests.
+    """
+
+    from ingestion.embedder import generate_embedding
+
+    if not obligation_text or not obligation_text.strip():
+        raise ValueError(
+            "Obligation text cannot be empty"
+        )
+
+    if not source_text or not source_text.strip():
+        raise ValueError(
+            "Source text cannot be empty"
+        )
+
+    obligation_embedding = generate_embedding(
+        obligation_text
+    )
+
+    source_embedding = generate_embedding(
+        source_text
+    )
+
+    similarity = cosine_similarity(
+        obligation_embedding,
+        source_embedding,
+    )
+
+    verification_status = (
+        "VERIFIED"
+        if similarity >= threshold
+        else "NOT_VERIFIED"
+    )
+
+    return {
+        "verified": similarity >= threshold,
+        "verification_status": verification_status,
+        "grounding_score": similarity,
+        "source_text": source_text,
+        "reason": (
+            "Semantic similarity is above "
+            "the verification threshold."
+            if similarity >= threshold
+            else "Semantic similarity is below "
+                 "the verification threshold."
+        ),
+    }
+
+
+============================================================
+FILE: agents\risk_engine.py
+============================================================
+from typing import Optional
+
+
+def calculate_days_until_deadline(
+    deadline_date,
+    reference_date,
+) -> Optional[int]:
+    """
+    Calculate the number of days between the reference date
+    and the contractual deadline.
+
+    Returns:
+        Number of days until the deadline.
+        Negative value means the deadline has passed.
+        None when no deadline is available.
+    """
+
+    if deadline_date is None:
+        return None
+
+    return (deadline_date.date() - reference_date.date()).days
+
+
+def calculate_risk_tier(
+    days_until_deadline: Optional[int],
+    verification_status: str = "PENDING",
+) -> str:
+    """
+    Assign a risk tier based on deadline proximity
+    and source verification status.
+
+    Risk rules:
+
+    NOT_VERIFIED -> REVIEW
+
+    No deadline -> NO_DEADLINE
+
+    Overdue -> HIGH
+
+    0-7 days -> HIGH
+
+    8-30 days -> MEDIUM
+
+    More than 30 days -> LOW
+    """
+
+    if verification_status == "NOT_VERIFIED":
+        return "REVIEW"
+
+    if days_until_deadline is None:
+        return "NO_DEADLINE"
+
+    if days_until_deadline <= 7:
+        return "HIGH"
+
+    if days_until_deadline <= 30:
+        return "MEDIUM"
+
+    return "LOW"
+
+
+def evaluate_obligation(
+    deadline_date,
+    reference_date,
+    verification_status: str = "PENDING",
+) -> dict:
+    """
+    Evaluate an obligation's deadline and risk tier.
+    """
+
+    days_until_deadline = calculate_days_until_deadline(
+        deadline_date,
+        reference_date,
+    )
+
+    risk_tier = calculate_risk_tier(
+        days_until_deadline,
+        verification_status,
+    )
+
+    return {
+        "days_until_deadline": days_until_deadline,
+        "risk_tier": risk_tier,
+    }
+
+
+============================================================
+FILE: agents\validation.py
+============================================================
+from typing import Optional
+
+from pydantic import BaseModel, ConfigDict, ValidationError
+
+
+class Obligation(BaseModel):
+    """
+    Structured representation of a contractual obligation.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    party_responsible: Optional[str] = None
+    obligation_text: str
+    deadline: Optional[str] = None
+    clause_reference: Optional[str] = None
+
+
+def validate_obligation(data: dict) -> Obligation:
+    """
+    Validate a single extracted obligation.
+
+    Args:
+        data: Raw obligation dictionary returned by the LLM.
+
+    Returns:
+        A validated Obligation object.
+
+    Raises:
+        ValueError: If the obligation does not satisfy the schema.
+    """
+
+    try:
+        return Obligation.model_validate(data)
+
+    except ValidationError as exc:
+        raise ValueError(
+            f"Invalid obligation data: {exc}"
+        ) from exc
+
+
+def validate_obligations(data: list[dict]) -> list[Obligation]:
+    """
+    Validate a list of extracted obligations.
+
+    Args:
+        data: List of raw obligation dictionaries.
+
+    Returns:
+        List of validated Obligation objects.
+
+    Raises:
+        ValueError: If the input is not a list or contains
+                    invalid obligation data.
+    """
+
+    if not isinstance(data, list):
+        raise ValueError("Obligations must be provided as a list")
+
+    validated_obligations = []
+
+    for item in data:
+        validated_obligations.append(
+            validate_obligation(item)
+        )
+
+    return validated_obligations
+
+
+============================================================
+FILE: database\models.py
+============================================================
+
+
+============================================================
+FILE: database\retrieval.py
+============================================================
+from sqlalchemy import text
+
+from database.db import engine
+from ingestion.embedder import generate_embedding
+
+
+def search_similar_chunks(
+    query: str,
+    contract_id: int,
+    top_k: int = 5,
+) -> list[dict]:
+    """
+    Find the most semantically similar contract chunks
+    for a given query.
+    """
+
+    if not query or not query.strip():
+        raise ValueError("Query cannot be empty")
+
+    query_embedding = generate_embedding(query)
+
+    sql = text("""
+        SELECT
+            id,
+            chunk_index,
+            content,
+            1 - (embedding <=> CAST(:embedding AS vector)) AS similarity
+        FROM document_chunks
+        WHERE contract_id = :contract_id
+        ORDER BY embedding <=> CAST(:embedding AS vector)
+        LIMIT :top_k
+    """)
+
+    with engine.connect() as connection:
+        result = connection.execute(
+            sql,
+            {
+                "embedding": str(query_embedding),
+                "contract_id": contract_id,
+                "top_k": top_k,
+            },
+        )
+
+        return [
+            {
+                "id": row.id,
+                "chunk_index": row.chunk_index,
+                "content": row.content,
+                "similarity": float(row.similarity),
+            }
+            for row in result
+        ]
+
+
+def get_obligations_by_contract(
+    contract_id: int,
+) -> list[dict]:
+    """
+    Retrieve all obligations belonging to a contract.
+    """
+
+    sql = text("""
+        SELECT
+            id,
+            contract_id,
+            party_responsible,
+            obligation_text,
+            deadline,
+            clause_reference,
+            verification_status,
+            grounding_score,
+            risk_tier,
+            days_until_deadline,
+            source_chunk_id,
+            created_at
+        FROM obligations
+        WHERE contract_id = :contract_id
+        ORDER BY id
+    """)
+
+    with engine.connect() as connection:
+        result = connection.execute(
+            sql,
+            {
+                "contract_id": contract_id,
+            },
+        )
+
+        return [
+            {
+                "id": row.id,
+                "contract_id": row.contract_id,
+                "party_responsible": row.party_responsible,
+                "obligation_text": row.obligation_text,
+                "deadline": row.deadline,
+                "clause_reference": row.clause_reference,
+                "verification_status": (
+                    row.verification_status
+                ),
+                "grounding_score": (
+                    float(row.grounding_score)
+                    if row.grounding_score is not None
+                    else None
+                ),
+                "risk_tier": row.risk_tier,
+                "days_until_deadline": (
+                    row.days_until_deadline
+                ),
+                "source_chunk_id": row.source_chunk_id,
+                "created_at": row.created_at,
+            }
+            for row in result
+        ]
